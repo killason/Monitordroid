@@ -1,0 +1,7 @@
+# Runtime dependencies
+kivy
+
+# Android USB Host / serial
+usb4a
+usbserial4a
+pyjnius
