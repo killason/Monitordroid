@@ -13,6 +13,9 @@
 # На выходе feed() возвращает готовые Modbus RTU кадры.
 # ============================================================
 
+# Максимальный размер Modbus RTU ADU вместе с адресом и CRC.
+MAX_RTU_FRAME_SIZE = 256
+
 
 # ============================================================
 # CRC16 MODBUS
@@ -167,36 +170,77 @@ def candidate_lengths(buffer):
     # --------------------------------------------------------
     # 07 Read Exception Status
     #
-    # Response = 4
+    # Request  = 4 bytes
+    # Response = 5 bytes
     # --------------------------------------------------------
 
     if function == 7:
 
-        return [4]
+        return [4, 5]
 
 
     # --------------------------------------------------------
-    # 0B Get Comm Event Counter
+    # 08 Diagnostics
     #
-    # Response = 8
+    # Request  = 8 bytes
+    # Response = 8 bytes
     # --------------------------------------------------------
 
-    if function == 11:
+    if function == 8:
 
         return [8]
 
 
     # --------------------------------------------------------
+    # 0B Get Comm Event Counter
+    #
+    # Request  = 4 bytes
+    # Response = 8 bytes
+    # --------------------------------------------------------
+
+    if function == 11:
+
+        return [4, 8]
+
+
+    # --------------------------------------------------------
     # 0C Get Comm Event Log
     #
-    # Variable response.
-    #
-    # Не пытаемся угадывать здесь.
+    # REQUEST:  4 bytes
+    # RESPONSE: 5 + byte_count bytes
     # --------------------------------------------------------
 
     if function == 12:
 
-        return []
+        result = [4]
+
+        if len(buffer) >= 3:
+
+            result.append(
+                5 + buffer[2]
+            )
+
+        return result
+
+
+    # --------------------------------------------------------
+    # 11 Report Server ID
+    #
+    # REQUEST:  4 bytes
+    # RESPONSE: 5 + byte_count bytes
+    # --------------------------------------------------------
+
+    if function == 17:
+
+        result = [4]
+
+        if len(buffer) >= 3:
+
+            result.append(
+                5 + buffer[2]
+            )
+
+        return result
 
 
     # --------------------------------------------------------
@@ -315,7 +359,10 @@ def candidate_lengths(buffer):
 
     if function == 23:
 
-        result = []
+        # В корректном запросе write byte count не меньше 2, поэтому
+        # минимальная длина запроса равна 15 байтам. Этот кандидат
+        # удерживает частичный запрос, пока byte_count ещё не получен.
+        result = [15]
 
         # Possible response
         if len(buffer) >= 3:
@@ -327,9 +374,11 @@ def candidate_lengths(buffer):
                 + byte_count
             )
 
-            result.append(
-                response_length
-            )
+            if response_length not in result:
+
+                result.append(
+                    response_length
+                )
 
         # Possible request
         if len(buffer) >= 11:
@@ -341,9 +390,11 @@ def candidate_lengths(buffer):
                 + byte_count
             )
 
-            result.append(
-                request_length
-            )
+            if request_length not in result:
+
+                result.append(
+                    request_length
+                )
 
         return result
 
@@ -351,14 +402,56 @@ def candidate_lengths(buffer):
     # --------------------------------------------------------
     # 43 / 0x2B
     #
-    # Encapsulated Interface Transport.
+    # Encapsulated Interface Transport, MEI 0x0E
+    # (Read Device Identification).
     #
-    # Пока специально не угадываем длину.
+    # REQUEST: 7 bytes
+    # RESPONSE: variable; its object list starts at byte 8.
     # --------------------------------------------------------
 
     if function == 43:
 
-        return []
+        if len(buffer) < 3 or buffer[2] != 0x0E:
+
+            return []
+
+        # 7 байт достаточно для полного запроса, но ещё недостаточно
+        # для заголовка ответа. Минимальный ответ содержит 10 байт:
+        # 8-байтный заголовок и CRC.
+        result = [7, 10]
+
+        if len(buffer) < 8:
+
+            return result
+
+        object_count = buffer[7]
+        position = 8
+
+        for _ in range(object_count):
+
+            # object id + object value length
+            if len(buffer) < position + 2:
+
+                result.append(position + 4)
+
+                return result
+
+            value_length = buffer[position + 1]
+            position += 2
+
+            if len(buffer) < position + value_length:
+
+                result.append(
+                    position + value_length + 2
+                )
+
+                return result
+
+            position += value_length
+
+        result.append(position + 2)
+
+        return result
 
 
     # --------------------------------------------------------
@@ -461,10 +554,10 @@ class ModbusRTUParser:
             address = self.buffer[0]
 
             if not (
-                1 <= address <= 247
+                0 <= address <= 247
             ):
 
-                # Это не допустимый slave address.
+                # Это не допустимый Modbus-адрес.
                 # Сдвигаем поток на один байт.
 
                 del self.buffer[0]
@@ -476,9 +569,13 @@ class ModbusRTUParser:
             # Получаем возможные длины
             # ------------------------------------------------
 
-            candidates = candidate_lengths(
-                self.buffer
-            )
+            candidates = [
+                length
+                for length in candidate_lengths(
+                    self.buffer
+                )
+                if 4 <= length <= MAX_RTU_FRAME_SIZE
+            ]
 
 
             # Неизвестная функция.
@@ -539,6 +636,18 @@ class ModbusRTUParser:
 
             if incomplete:
 
+                # Повреждённый префикс может объявить правдоподобную,
+                # но ложную длину и тем самым удерживать buffer. Если за
+                # ним уже есть полный кадр с корректным CRC, считаем
+                # префикс мусором и синхронизируемся по найденному кадру.
+                frame_start = self._find_complete_frame_after_prefix()
+
+                if frame_start is not None:
+
+                    del self.buffer[:frame_start]
+
+                    continue
+
                 return None
 
 
@@ -549,6 +658,47 @@ class ModbusRTUParser:
             # ------------------------------------------------
 
             del self.buffer[0]
+
+
+    def _find_complete_frame_after_prefix(self):
+        """
+        Ищет готовый CRC-проверенный кадр после текущего префикса.
+
+        Это позволяет восстановиться после ложной переменной длины без
+        зависимости от USB-таймингов.
+        """
+
+        for start in range(1, len(self.buffer) - 3):
+
+            address = self.buffer[start]
+
+            if not 0 <= address <= 247:
+
+                continue
+
+            candidates = [
+                length
+                for length in candidate_lengths(
+                    self.buffer[start:]
+                )
+                if 4 <= length <= MAX_RTU_FRAME_SIZE
+            ]
+
+            for length in candidates:
+
+                if len(self.buffer) - start < length:
+
+                    continue
+
+                candidate = bytes(
+                    self.buffer[start:start + length]
+                )
+
+                if crc_ok(candidate):
+
+                    return start
+
+        return None
 
 
     def clear(self):
