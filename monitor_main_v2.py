@@ -7,6 +7,7 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.label import Label
 from kivy.uix.filechooser import FileChooserListView
 from kivy.uix.popup import Popup
+from kivy.uix.spinner import Spinner
 from datetime import datetime
 from pathlib import Path
 
@@ -21,6 +22,13 @@ from modbus_method import ModbusRTUParser, format_frame
 
 
 BAUDRATE = 9600
+
+# Spinner option lists
+BAUD_RATES = ["1200", "2400", "4800", "9600", "19200", "38400", "57600", "115200"]
+DATA_BITS = ["5", "6", "7", "8"]
+PARITIES = ["N", "E", "O"]
+STOP_BITS = ["1", "1.5", "2"]
+PROTOCOLS = ["ModbusRTU"]
 
 
 def timestamp():
@@ -45,10 +53,72 @@ class ModbusMonitorApp(App):
         self.device = None
         self.ser = None
         self.parser = ModbusRTUParser()
+        self.permission_granted = False
+        self.start_after_permission = False
 
         root = BoxLayout(
             orientation="vertical"
         )
+
+        # ====================================================
+        # DROPDOWNS (Spinners) - AT TOP
+        # ====================================================
+
+        spinners = BoxLayout(
+            orientation="horizontal",
+            size_hint_y=None,
+            height="45dp",
+            spacing="6dp",
+            padding=[8, 5],
+        )
+
+        self.baud_spinner = Spinner(
+            text=str(BAUDRATE),
+            values=BAUD_RATES,
+            size_hint=(None, None),
+            size=("90dp", "36dp"),
+            font_size="14sp",
+        )
+
+        self.bits_spinner = Spinner(
+            text="8",
+            values=DATA_BITS,
+            size_hint=(None, None),
+            size=("60dp", "36dp"),
+            font_size="14sp",
+        )
+
+        self.parity_spinner = Spinner(
+            text="N",
+            values=PARITIES,
+            size_hint=(None, None),
+            size=("60dp", "36dp"),
+            font_size="14sp",
+        )
+
+        self.stop_spinner = Spinner(
+            text="1",
+            values=STOP_BITS,
+            size_hint=(None, None),
+            size=("60dp", "36dp"),
+            font_size="14sp",
+        )
+
+        self.protocol_spinner = Spinner(
+            text=PROTOCOLS[0],
+            values=PROTOCOLS,
+            size_hint=(None, None),
+            size=("110dp", "36dp"),
+            font_size="14sp",
+        )
+
+        spinners.add_widget(self.baud_spinner)
+        spinners.add_widget(self.bits_spinner)
+        spinners.add_widget(self.parity_spinner)
+        spinners.add_widget(self.stop_spinner)
+        spinners.add_widget(self.protocol_spinner)
+
+        root.add_widget(spinners)
 
         # ====================================================
         # SCROLLVIEW + LABELS
@@ -191,7 +261,11 @@ class ModbusMonitorApp(App):
             )
 
             if has_permission(self.device):
-                self.open_port()
+                # Don't open port automatically; open on Start so spinner settings apply
+                self.permission_granted = True
+                self.log_line(
+                    "USB permission есть — порт откроется при нажатии СТАРТ"
+                )
             else:
                 self.log_line(
                     "Запрашиваю USB permission..."
@@ -216,11 +290,21 @@ class ModbusMonitorApp(App):
                     self.check_permission
                 )
 
+                self.permission_granted = True
+
                 self.log_line(
                     "USB permission получен"
                 )
 
-                self.open_port()
+                # If Start was pressed while waiting for permission, open port and start
+                if getattr(self, 'start_after_permission', False):
+                    self.start_after_permission = False
+                    try:
+                        self.open_port()
+                        # proceed to start monitoring now that port is open
+                        self.start_monitoring()
+                    except BaseException as e:
+                        self.show_error(e)
 
         except BaseException as e:
             Clock.unschedule(
@@ -231,16 +315,26 @@ class ModbusMonitorApp(App):
 
     def open_port(self):
         try:
+            # Read values from spinners if available, otherwise fall back to defaults
+            baud = int(self.baud_spinner.text) if hasattr(self, "baud_spinner") else BAUDRATE
+            bytesize = int(self.bits_spinner.text) if hasattr(self, "bits_spinner") else 8
+            parity = self.parity_spinner.text if hasattr(self, "parity_spinner") else "N"
+            stop_text = self.stop_spinner.text if hasattr(self, "stop_spinner") else "1"
+            try:
+                stopbits = float(stop_text) if "." in stop_text else int(stop_text)
+            except Exception:
+                stopbits = 1
+
             self.ser = open_rs485(
                 self.device,
-                baudrate=BAUDRATE,
-                bytesize=8,
-                parity="N",
-                stopbits=1,
+                baudrate=baud,
+                bytesize=bytesize,
+                parity=parity,
+                stopbits=stopbits,
             )
 
             self.log_line("RS485 OPEN")
-            self.log_line("9600 8N1")
+            self.log_line(f"{baud} {bytesize}{parity}{stop_text}")
             self.log_line("Готов. Нажмите СТАРТ.")
 
         except BaseException as e:
@@ -251,11 +345,33 @@ class ModbusMonitorApp(App):
     # ========================================================
 
     def start_monitoring(self, *args):
+        # If port isn't open yet, attempt to open it now using spinner values.
         if self.ser is None:
-            self.log_line(
-                "ERROR: RS485 порт не открыт"
-            )
-            return
+            # Ensure device exists
+            if self.device is None:
+                # try to find device now
+                self.device = find_rs485()
+                if self.device is None:
+                    self.log_line(
+                        "ERROR: RS485 устройство не найдено"
+                    )
+                    return
+
+            # Ensure permission
+            if not has_permission(self.device):
+                self.log_line("Запрашиваю USB permission для открытия порта...")
+                request_permission(self.device)
+                # mark that user wants to start after permission
+                self.start_after_permission = True
+                Clock.schedule_interval(self.check_permission, 0.2)
+                return
+
+            # Open port now (uses spinner values)
+            try:
+                self.open_port()
+            except BaseException as e:
+                self.show_error(e)
+                return
 
         if self.running:
             return
@@ -285,6 +401,22 @@ class ModbusMonitorApp(App):
             self.read_event = None
 
         self.parser.clear()
+
+        # Close serial port and clear buffer
+        if self.ser is not None:
+            try:
+                # Flush any remaining data in buffer
+                if hasattr(self.ser, 'reset_input_buffer'):
+                    self.ser.reset_input_buffer()
+                if hasattr(self.ser, 'reset_output_buffer'):
+                    self.ser.reset_output_buffer()
+                # Close the port
+                self.ser.close()
+                self.log_line("RS485 закрыт")
+            except BaseException as e:
+                self.log_line("WARN: ошибка при закрытии порта: " + repr(e))
+            finally:
+                self.ser = None
 
         # После этой строки log_line() уже НЕ вызывает
         # автоматическую прокрутку.
