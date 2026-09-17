@@ -65,6 +65,7 @@ class ModbusMonitorApp(App):
         self.permission_granted = False
         self.start_after_permission = False
         self.periodic_send_event = None
+        self.periodic_send_event = None
         self.log_buffer = []
         self.log_limit = 300
         self.log_refresh_pending = False
@@ -179,8 +180,7 @@ class ModbusMonitorApp(App):
         self.input_field = TextInput(
             hint_text="Напр.: 01 03 00 00 00 06 (без CRC)",
             multiline=False,
-            size_hint_x=None,
-            width="220dp",
+            size_hint_x=1,
             font_size="14sp",
         )
 
@@ -189,21 +189,21 @@ class ModbusMonitorApp(App):
         self.mode_buttons = BoxLayout(
             orientation="horizontal",
             size_hint_x=None,
-            width="140dp",
+            width="120dp",
             spacing="4dp",
         )
 
         self.single_button = Button(
             text="SINGLE",
             size_hint_x=None,
-            width="68dp",
+            width="56dp",
             font_size="12sp",
         )
 
         self.period_button = Button(
             text="PERIOD",
             size_hint_x=None,
-            width="68dp",
+            width="58dp",
             font_size="12sp",
         )
 
@@ -227,7 +227,7 @@ class ModbusMonitorApp(App):
         self.send_button = Button(
             text="➤",
             size_hint_x=None,
-            width="54dp",
+            width="50dp",
             font_size="24sp",
         )
 
@@ -782,12 +782,14 @@ class ModbusMonitorApp(App):
         if mode == "Period":
             self.period_input.disabled = False
             self.period_input.opacity = 1
-            self.period_input.width = "90dp"
+            self.period_input.size_hint_x = None
+            self.period_input.width = "80dp"
             self.single_button.disabled = False
             self.period_button.disabled = False
         else:
             self.period_input.disabled = True
             self.period_input.opacity = 0
+            self.period_input.size_hint_x = None
             self.period_input.width = 0
             self.single_button.disabled = False
             self.period_button.disabled = False
